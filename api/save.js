@@ -1,30 +1,66 @@
-export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+// api/save.js
+function withCORS(res, origin = "*") {
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "OPTIONS, POST");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  return res;
+}
 
-  if (req.method === "OPTIONS") return res.status(200).send("ok");
-  if (req.method !== "POST") return res.status(405).send("Only POST allowed");
+export default async function handler(req, res) {
+  // Always attach CORS
+  withCORS(res);
+
+  // Handle preflight
+  if (req.method === "OPTIONS") {
+    return res.status(204).send(""); // no body
+  }
+
+  if (req.method !== "POST") {
+    return res.status(405).send("Only POST allowed");
+  }
 
   try {
     const auth = req.headers.authorization || "";
     const expected = `Bearer ${process.env.CLIENT_SHARED_KEY}`;
-    if (auth !== expected) return res.status(401).send("Unauthorized");
+    if (auth !== expected) {
+      return res.status(401).send("Unauthorized");
+    }
 
-    const { json, message, owner = "synergytao", repo = "synergytaohub-directory", path = "data/directory.json", branch = "main" } = req.body || {};
-    if (!json) return res.status(400).send("Bad Request: include { json }");
+    const {
+      json,
+      message,
+      owner = "synergytao",
+      repo = "synergytaohub-directory",
+      path = "data/directory.json",
+      branch = "main"
+    } = req.body || {};
+
+    if (!json) {
+      return res.status(400).send("Bad Request: include { json }");
+    }
 
     const commitMsg = message || `Update ${path} via directory admin`;
 
-    // 1) Get current SHA
+    // 1) get current SHA
     const getUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`;
     const getRes = await fetch(getUrl, {
-      headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
+      headers: {
+        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+        "User-Agent": "sth-directory-proxy"
+      }
     });
+
+    if (!getRes.ok) {
+      const t = await getRes.text();
+      return res.status(500).send(`GitHub GET failed: ${t}`);
+    }
+
     const current = await getRes.json();
     const sha = current.sha;
 
-    // 2) Encode new content
+    // 2) base64 encode new content
     const text = typeof json === "string" ? json : JSON.stringify(json, null, 2);
     const b64 = Buffer.from(text, "utf8").toString("base64");
 
@@ -33,14 +69,22 @@ export default async function handler(req, res) {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "sth-directory-proxy"
       },
       body: JSON.stringify({ message: commitMsg, content: b64, sha, branch })
     });
 
+    if (!putRes.ok) {
+      const t = await putRes.text();
+      return res.status(500).send(`GitHub PUT failed: ${t}`);
+    }
+
     const out = await putRes.json();
     return res.status(200).json({ ok: true, commit: out.commit && out.commit.sha });
   } catch (err) {
-    return res.status(500).send(`Server error: ${err.message}`);
+    // Ensure errors still include CORS
+    withCORS(res);
+    return res.status(500).send(`Server error: ${err?.message || String(err)}`);
   }
 }
